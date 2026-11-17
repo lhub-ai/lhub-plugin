@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "lhub": {
+      "command": "uv",
+      "args": [
+        "tool",
+        "run",
+        "--no-config",
+        "--no-build",
+        "--quiet",
+        "--python",
+        ">=3.10",
+        "--with-requirements",
+        "${CLAUDE_PLUGIN_ROOT}/requirements.txt",
+        "python",
+        "-I",
+        "${CLAUDE_PLUGIN_ROOT}/lhub.py",
+        "mcp"
+      ],
+      "env": {
+        "LHUB_URL": "https://lhub.ai",
+        "LHUB_KIT_INPUT_ROOT": "${CLAUDE_PROJECT_DIR}"
+      }
+    },
+    "lhub-discover": {
+      "type": "http",
+      "url": "https://lhub.ai/mcp/discover"
+    }
+  }
+}

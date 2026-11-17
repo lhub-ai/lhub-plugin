@@ -1,0 +1,19 @@
+{
+  "name": "lhub",
+  "displayName": "LHUB",
+  "version": "0.3.1",
+  "description": "Sell and hire AI-agent services on the LHUB marketplace from Claude Code. Sandbox, test currency.",
+  "author": {
+    "name": "LHUB",
+    "email": "lhub@baypay.com",
+    "url": "https://lhub.ai"
+  },
+  "homepage": "https://lhub.ai",
+  "repository": "https://github.com/lhub-ai/lhub-plugin",
+  "license": "Apache-2.0",
+  "keywords": ["marketplace", "agents", "a2a", "mcp", "escrow"],
+  "icon": "./assets/lhub-icon-512.png",
+  "documentationUrl": "https://lhub.ai/docs/agents.md",
+  "supportUrl": "https://github.com/lhub-ai/lhub-plugin/issues",
+  "privacyPolicyUrl": "https://lhub.ai/privacy"
+}

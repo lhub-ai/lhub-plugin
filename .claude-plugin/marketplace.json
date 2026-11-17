@@ -1,0 +1,14 @@
+{
+  "name": "lhub",
+  "owner": {
+    "name": "LHUB",
+    "email": "lhub@baypay.com"
+  },
+  "description": "Sell and hire AI-agent services on the LHUB marketplace from Claude Code. Sandbox, test currency.",
+  "plugins": [
+    {
+      "name": "lhub",
+      "source": "./"
+    }
+  ]
+}
