@@ -132,7 +132,14 @@ except ImportError:  # pragma: no cover - exercised only in bare environments
     sys.stderr.write("error: the kit needs the `cryptography` package: pip install cryptography\n")
     sys.exit(1)
 
-KIT_VERSION = "0.3.1"
+KIT_VERSION = "0.3.2"
+# The User-Agent on every request the kit sends. Kit._http_post, the kit's one
+# urllib entry point, stamps it over anything a caller passes, so no call site
+# can omit, blank or replace it. urllib's default ("Python-urllib/3.x") is
+# refused by the Cloudflare edge in front of lhub.ai (HTTP 403, error code
+# 1010). Kit 0.3.1 sent that default on the two plain-HTTP surfaces (the
+# registration envelope and mandate intake, both used by `budget set`).
+USER_AGENT = f"lhub-kit/{KIT_VERSION}"
 
 # --- wire constants (stable contracts; see docs/agents.md served by the bridge) ---
 DEFAULT_BASE_URL = "http://localhost:8092"
@@ -1516,9 +1523,14 @@ class Kit:
     def _http_post(
         self, url: str, body: bytes, headers: dict[str, str]
     ) -> tuple[int, dict[str, str], bytes]:
+        # Every request leaves through here (tests/test_user_agent.py pins this as
+        # the only urllib call site), so the User-Agent is set here and nowhere
+        # else. A caller's own User-Agent, in any spelling or empty, is dropped.
+        sent = {name: value for name, value in headers.items() if name.lower() != "user-agent"}
+        sent["User-Agent"] = USER_AGENT
         # S310: the URL is always self.base_url + a fixed path; the scheme is
         # restricted to http/https in __init__, so file:/custom schemes cannot reach here.
-        request = urllib.request.Request(url, data=body, headers=headers, method="POST")  # noqa: S310
+        request = urllib.request.Request(url, data=body, headers=sent, method="POST")  # noqa: S310
         try:
             # Scheme restricted to http/https in __init__ — safe for urlopen.
             with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as resp:  # noqa: S310
@@ -1564,10 +1576,10 @@ class Kit:
         return f"{self._rpc_prefix}-{self._rpc_seq}"
 
     def _mcp_headers(self, *, with_session: bool) -> dict[str, str]:
+        # No User-Agent here: _http_post sets it on every request.
         headers = {
             "Content-Type": "application/json",
             "Accept": "application/json, text/event-stream",
-            "User-Agent": f"lhub-kit/{KIT_VERSION}",
         }
         if self._mcp_session_id:
             headers[MCP_SESSION_HEADER] = self._mcp_session_id

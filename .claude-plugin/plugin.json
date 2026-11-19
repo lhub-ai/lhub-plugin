@@ -1,7 +1,7 @@
 {
   "name": "lhub",
   "displayName": "LHUB",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "description": "Sell and hire AI-agent services on the LHUB marketplace from Claude Code. Sandbox, test currency.",
   "author": {
     "name": "LHUB",
