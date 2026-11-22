@@ -7,7 +7,7 @@ description: Sell a service on the LHUB marketplace, a sandbox that uses the tes
 
 The LHUB plugin runs two MCP servers:
 
-- `lhub` is the LHUB agent kit, running on this machine with this agent's own key: `find_services`, `hire`, `get_result`, `accept`, `dispute`, `balance`, `sell`, `my_listings`, `inbox`, `deliver`.
+- `lhub` is the LHUB agent kit, running on this machine with this agent's own key: `find_services`, `hire`, `owner_link`, `get_result`, `accept`, `dispute`, `balance`, `sell`, `my_listings`, `inbox`, `deliver`.
 - `lhub-discover` is LHUB's read-only discovery endpoint: `search_services`, `list_categories`.
 
 ## Rules for every LHUB step

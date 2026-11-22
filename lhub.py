@@ -7,6 +7,7 @@ Usage (full docs: /docs/agents.md and /docs/sell.md on the marketplace host):
     python lhub.py init
     python lhub.py find --category digital_services/code/review
     python lhub.py hire --listing <id> --input ./myfile.py --max-price 1.00
+    python lhub.py owner-link --deal <id>   # no budget: a one-time approval link for the owner
     python lhub.py result --deal <id> --out ./review.md
     python lhub.py accept --deal <id>
 
@@ -42,6 +43,13 @@ Design (add-agent-front-door D-11):
     prints that ``deal_id``, the ``stage`` reached (``opened`` / ``proposed``
     / ``agreed``) and a ``next_step``: run ``status --deal <id>`` before
     hiring again, or a second deal may be agreed and funded too.
+  * A ``hire`` that stops in AWAITING_CONFIRM (no owner budget covers the
+    deal) asks the marketplace for ONE owner approval link and prints it with
+    its expiry, for the human owner to open (add-owner-confirm-link D-11).
+    ``owner-link --deal <id>`` asks for a new one (it replaces the previous
+    link); ``status`` never asks. The kit prints a link only on its own
+    marketplace origin (https, or http on a loopback host), never opens or
+    POSTs it, and stores no link.
   * Machine-readable JSON on stdout; human hints on stderr; non-zero exit with
     a one-line reason on failure.
 
@@ -115,7 +123,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable, Mapping
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, NamedTuple, NoReturn
 
@@ -132,7 +140,7 @@ except ImportError:  # pragma: no cover - exercised only in bare environments
     sys.stderr.write("error: the kit needs the `cryptography` package: pip install cryptography\n")
     sys.exit(1)
 
-KIT_VERSION = "0.3.2"
+KIT_VERSION = "0.3.3"
 # The User-Agent on every request the kit sends. Kit._http_post, the kit's one
 # urllib entry point, stamps it over anything a caller passes, so no call site
 # can omit, blank or replace it. urllib's default ("Python-urllib/3.x") is
@@ -264,6 +272,58 @@ _DECIMAL_AMOUNT_FORM = re.compile(r"(0|[1-9][0-9]*)(\.[0-9]{1,6})?")
 CODE_REVIEW_CATEGORY = "digital_services/code/review"
 # The deal state on which countersigning is possible.
 STATE_NEGOTIATING = "NEGOTIATING"
+# The deal state a hire stops in when no owner budget covers the deal.
+STATE_AWAITING_CONFIRM = "AWAITING_CONFIRM"
+# get_deal's `role` for the seller side of a deal (the bridge's agreeActorProvider).
+ROLE_PROVIDER = "provider"
+
+# --- the owner confirm link (add-owner-confirm-link D-11) ---
+
+# The bridge tool that mints a one-time link the buyer's human owner opens to
+# confirm (fund) one deal in AWAITING_CONFIRM. The kit exposes it as the
+# `owner-link` command and the `owner_link` MCP tool; only those two and a
+# `hire` that ends in AWAITING_CONFIRM call it (the minting rule): `status` is
+# a read and must not replace the owner's live link or spend a unit.
+OWNER_LINK_TOOL = "request_owner_confirm"
+# What the kit prints beside a link that passed its checks. The kit's own words,
+# naming the human (D-11 Slice 2 rulings): the bridge's next_step and its `note`
+# name request_owner_confirm, a bridge tool a kit user cannot call.
+OWNER_LINK_INSTRUCTION = (
+    "For your human owner: open this link yourself to approve — your agent must not open it"
+)
+# A link is printed only when its path is exactly /confirm/ + the bridge's
+# 43-character base64url token (D-1), and the URL is nothing but
+# scheme://host[:port] + that path: no query, fragment, userinfo or dot-segment.
+# An http link is printed only for a loopback host (the bridge's D-3 rule).
+_OWNER_LINK_PATH_FORM = re.compile(r"/confirm/[A-Za-z0-9_-]{43}")
+_OWNER_LINK_NETLOC_FORM = re.compile(r"(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])(?::[0-9]{1,5})?")
+# Far above any real link (origin + 52 characters), so the checks stay cheap.
+OWNER_LINK_MAX_CHARS = 2048
+# RFC 3339 date-time (section 5.6), ASCII digits only. The fraction may have any
+# number of digits: the bridge writes Go's RFC3339Nano, which drops trailing
+# zeros (0 to 9 digits), and Python 3.10's fromisoformat takes only 3 or 6.
+_RFC3339_FORM = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})[Tt]([0-9]{2}):([0-9]{2}):([0-9]{2})"
+    r"(\.[0-9]+)?([Zz]|[+-][0-9]{2}:[0-9]{2})"
+)
+RFC3339_MAX_CHARS = 64
+# A counterparty string printed beside a link shows every code point outside
+# printable ASCII as this visible escape (upper-case hex, at least four digits),
+# the form the confirm page uses (D-4). Nothing is deleted: deleting could join
+# the pieces of a split fence marker. The backslash is built from its code point
+# so this source holds no escape sequence a tool could rewrite.
+_VISIBLE_ESCAPE = chr(0x5C) + "u{{{:04X}}}"
+# The bridge's rule for a fence marker inside fenced text
+# (services/protocol-bridge/internal/untrusted/untrusted.go escapeMarkers): a
+# token matched with A-Z folded to a-z is replaced whole, its leading "[" written
+# as "&#91;" and the rest in the canonical upper case. Closing marker first.
+_FENCE_MARKER_NEUTRALISED = (
+    (FENCE_CLOSE, "&#91;/UNTRUSTED-CONTENT]"),
+    (FENCE_OPEN, "&#91;UNTRUSTED-CONTENT]"),
+)
+# Folds A-Z to a-z and leaves every other code point as it is (one code point to
+# one), so offsets in a folded copy address the same characters as the original.
+_ASCII_LOWER = {cp: cp + 0x20 for cp in range(0x41, 0x5B)}
 
 # Deal states at which `hire` stops polling.
 HIRE_SUCCESS_STATES = frozenset(
@@ -1152,7 +1212,7 @@ def fallback_next_step(state: str) -> str:
     table = {
         "NEGOTIATING": "waiting for the provider to countersign; re-run: python lhub.py status --deal <id>",
         "DEAL_AGREED": "agreed; funding is in progress",
-        "AWAITING_CONFIRM": "awaiting the owner's confirmation for THIS deal; a budget set now does not cover it — the owner can pre-authorize FUTURE deals with: python lhub.py budget set",
+        "AWAITING_CONFIRM": "awaiting the owner's confirmation for THIS deal; a budget set now does not cover it — the owner can pre-authorize FUTURE deals with: python lhub.py budget set, or get a one-time approval link with: python lhub.py owner-link --deal <id>",
         "FUNDED": "funded; fulfilment starts next",
         "IN_FULFILLMENT": "the provider is working; poll: python lhub.py result --deal <id> --out <file>",
         "PROOF_SUBMITTED": "download and verify the deliverable: python lhub.py result --deal <id> --out <file>",
@@ -1163,6 +1223,21 @@ def fallback_next_step(state: str) -> str:
         "SPLIT": "resolved by arbitration with a split",
     }
     return table.get(state, "re-run: python lhub.py status --deal <id>")
+
+
+def owner_confirm_next_step(deal_id: object) -> str:
+    """The kit's own AWAITING_CONFIRM text for the buyer (add-owner-confirm-link D-11).
+
+    The fallback text above, naming the kit's ``owner-link`` command, with the
+    deal filled in when ``deal_id`` is a UUID (anything else keeps the ``<id>``
+    placeholder, so no bridge-supplied text lands in a shown command line).
+    ``status``, ``result``'s failure payload and a ``hire`` that got no usable
+    link print it instead of the bridge's ``next_step``.
+    """
+    text = fallback_next_step(STATE_AWAITING_CONFIRM)
+    if isinstance(deal_id, str) and _UUID_FORM.fullmatch(deal_id) is not None:
+        text = text.replace("--deal <id>", f"--deal {deal_id.lower()}")
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -2086,12 +2161,194 @@ def _rfc3339_to_unix(text: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# The owner confirm link (add-owner-confirm-link D-11): the checks a link and its
+# expiry pass before the kit prints them, and the stripping applied to the
+# counterparty strings printed beside them. Pure, so tests drive every refusal.
+# ---------------------------------------------------------------------------
+
+
+def parse_rfc3339(text: object) -> datetime | None:
+    """An RFC 3339 date-time (section 5.6) as an aware UTC datetime, or None.
+
+    Strict: ASCII digits, ``T``/``t`` between date and time, an offset of
+    ``Z``/``z`` or ``+hh:mm``/``-hh:mm``, and real calendar values (no leap
+    second: Python cannot hold one and the bridge never writes one). The
+    fraction may have any number of digits (the bridge's Go RFC3339Nano writes 0
+    to 9) and is kept to the microsecond. Works on every Python the kit
+    supports, unlike 3.10's ``fromisoformat``.
+    """
+    if not isinstance(text, str) or len(text) > RFC3339_MAX_CHARS:
+        return None
+    match = _RFC3339_FORM.fullmatch(text)
+    if match is None:
+        return None
+    year, month, day, hour, minute, second = (int(group) for group in match.groups()[:6])
+    fraction, offset = match.group(7), match.group(8)
+    micro = int(fraction[1:7].ljust(6, "0")) if fraction else 0
+    try:
+        moment = datetime(year, month, day, hour, minute, second, micro, tzinfo=timezone.utc)
+    except ValueError:  # month 13, February 30, hour 24, second 60, ...
+        return None
+    if offset in ("Z", "z"):
+        return moment
+    offset_hours, offset_minutes = int(offset[1:3]), int(offset[4:6])
+    if offset_hours > 23 or offset_minutes > 59:
+        return None
+    shift = timedelta(hours=offset_hours, minutes=offset_minutes)
+    try:
+        return moment - shift if offset[0] == "+" else moment + shift
+    except OverflowError:  # an offset that pushes year 1 or 9999 out of range
+        return None
+
+
+def _visible_escapes(text: str) -> str:
+    """``text`` with every code point outside printable ASCII (0x20-0x7E) shown as
+    a visible escape: a backslash, ``u{``, the code point in upper-case hex (at
+    least four digits) and ``}``, as the confirm page shows an identifier (D-4).
+
+    That covers C0 controls (tab and line feed included), DEL, C1 controls, bidi
+    controls, Unicode tag characters, zero-width and other format characters, the
+    BOM and every non-ASCII letter. Nothing is deleted, so no two pieces of the
+    input are ever joined.
+    """
+    return "".join(ch if " " <= ch <= "~" else _VISIBLE_ESCAPE.format(ord(ch)) for ch in text)
+
+
+def _neutralise_fence_markers(text: str) -> str:
+    """``text`` with every fence-marker token, in any ASCII letter case, rewritten
+    by the bridge's rule (untrusted.go ``escapeMarkers``): the token is replaced
+    whole by its neutralised form, whose leading ``[`` is ``&#91;``.
+
+    As in the bridge, only A-Z fold, matches never overlap, and a replacement
+    holds no ``[``, so it can neither create nor complete another marker.
+    """
+    out = text
+    for token, neutralised in _FENCE_MARKER_NEUTRALISED:
+        folded_token = token.translate(_ASCII_LOWER)
+        folded = out.translate(_ASCII_LOWER)
+        at = folded.find(folded_token)
+        if at < 0:
+            continue
+        parts: list[str] = []
+        start = 0
+        while at >= 0:
+            parts.extend((out[start:at], neutralised))
+            start = at + len(token)
+            at = folded.find(folded_token, start)
+        parts.append(out[start:])
+        out = "".join(parts)
+    return out
+
+
+def counterparty_text(value: str) -> str:
+    """A counterparty string from the bridge, ready to print (D-11 as amended at the
+    Slice 2 security review).
+
+    Every code point outside printable ASCII becomes a visible escape
+    (``_visible_escapes``), then every fence-marker token left, in any ASCII case,
+    is neutralised by the bridge's rule (``_neutralise_fence_markers``). A value
+    the bridge fenced as untrusted content (SEC-2) keeps its outer marker pair and
+    the fence's two line feeds, and holds no other marker; any other value holds
+    no marker at all. Characters are never deleted: deleting can join the pieces
+    of a marker the bridge's exact-byte escaping did not match (a did:key
+    ``#fragment`` is unconstrained) and end the fence early, beside a live link.
+    """
+    head, tail = FENCE_OPEN + "\n", "\n" + FENCE_CLOSE
+    if len(value) >= len(head) + len(tail) and value.startswith(head) and value.endswith(tail):
+        inner = value[len(head) : len(value) - len(tail)]
+        return head + _neutralise_fence_markers(_visible_escapes(inner)) + tail
+    return _neutralise_fence_markers(_visible_escapes(value))
+
+
+def _url_origin(url: str) -> tuple[str, str, int] | None:
+    """The origin of an http(s) URL as ``(scheme, host, port)``: scheme and host
+    lower-cased, a missing port as the scheme's default; None when it has none."""
+    try:
+        parts = urllib.parse.urlsplit(url)
+        port = parts.port
+    except ValueError:  # a malformed IPv6 literal or port
+        return None
+    scheme = parts.scheme.lower()
+    host = (parts.hostname or "").lower()
+    if scheme not in ("http", "https") or not host:
+        return None
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, host, port
+
+
+def _origin_text(origin: tuple[str, str, int] | None) -> str:
+    """An origin as ``scheme://host[:port]`` (the port only when not the default)."""
+    if origin is None:
+        return "an unusable origin"
+    scheme, host, port = origin
+    shown = f"[{host}]" if ":" in host else host
+    default = 443 if scheme == "https" else 80
+    return f"{scheme}://{shown}" if port == default else f"{scheme}://{shown}:{port}"
+
+
+def check_owner_link(confirm_url: object, *, base_url: str) -> str:
+    """Return ``confirm_url`` when the kit may print it; raise :class:`KitError` otherwise.
+
+    D-11: after URL parsing, the link's origin equals the kit's base origin
+    (``base_url``'s scheme, host and port), its path is ``/confirm/`` plus a
+    43-character token, and it has no query, fragment, userinfo or dot-segment.
+    It must also be printable ASCII and nothing but
+    ``scheme://host[:port]/confirm/<token>``, and an ``http`` link must be on a
+    loopback host (127.0.0.0/8, ::1, localhost), mirroring the bridge's D-3 rule:
+    a bearer link that can fund escrow is never shown for a cleartext remote
+    host. A refusal never repeats the link: it may point anywhere, and kit errors
+    reach an LLM through ``lhub.py mcp``.
+    """
+
+    def refuse(reason: str) -> KitError:
+        return KitError(f"the marketplace's owner link {reason}; not showing it")
+
+    if not isinstance(confirm_url, str) or not confirm_url:
+        raise refuse("is missing")
+    if len(confirm_url) > OWNER_LINK_MAX_CHARS:
+        raise refuse("is too long")
+    if not all("!" <= ch <= "~" for ch in confirm_url):
+        raise refuse("is not a printable-ASCII URL")
+    origin = _url_origin(confirm_url)
+    if origin is None:
+        raise refuse("is not an http(s) URL")
+    parts = urllib.parse.urlsplit(confirm_url)
+    if "@" in parts.netloc:
+        raise refuse("carries userinfo")
+    if "?" in confirm_url or parts.query:
+        raise refuse("carries a query")
+    if "#" in confirm_url or parts.fragment:
+        raise refuse("carries a fragment")
+    for segment in parts.path.split("/"):
+        if segment.lower().replace("%2e", ".") in (".", ".."):
+            raise refuse("carries a dot-segment")
+    if _OWNER_LINK_PATH_FORM.fullmatch(parts.path) is None:
+        raise refuse("is not /confirm/ plus a 43-character token")
+    rebuilt = f"{parts.scheme}://{parts.netloc}{parts.path}"
+    if _OWNER_LINK_NETLOC_FORM.fullmatch(parts.netloc) is None or confirm_url != rebuilt:
+        raise refuse("is not a plain scheme://host[:port]/confirm/<token> URL")
+    if origin[0] == "http" and not _is_loopback_host(origin[1]):
+        raise refuse("is plain http to a host that is not loopback")
+    base_origin = _url_origin(base_url)
+    if origin != base_origin:
+        raise refuse(f"is not on this kit's marketplace origin ({_origin_text(base_origin)})")
+    return confirm_url
+
+
+# ---------------------------------------------------------------------------
 # Flows shared by the CLI and the MCP stdio server.
 # ---------------------------------------------------------------------------
 
 
 def _deal_view(deal: Mapping[str, Any]) -> dict[str, Any]:
-    """A compact buyer view of a get_deal payload, with kit-side fallbacks."""
+    """A compact buyer view of a get_deal payload, with kit-side fallbacks.
+
+    In AWAITING_CONFIRM the buyer's ``next_step`` is always the kit's own text
+    (add-owner-confirm-link D-11), never the bridge's: the bridge's names
+    request_owner_confirm, a bridge tool a kit user cannot call. A provider's
+    ``next_step`` passes through.
+    """
     state = str(deal.get("state") or "")
     amount = deal.get("amount")
     display = deal.get("display")
@@ -2103,7 +2360,9 @@ def _deal_view(deal: Mapping[str, Any]) -> dict[str, Any]:
         else:
             display = None
     next_step = deal.get("next_step")
-    if not isinstance(next_step, str) or not next_step:
+    if state == STATE_AWAITING_CONFIRM and deal.get("role") != ROLE_PROVIDER:
+        next_step = owner_confirm_next_step(deal.get("deal_id"))
+    elif not isinstance(next_step, str) or not next_step:
         next_step = fallback_next_step(state)
     view: dict[str, Any] = {
         "deal_id": deal.get("deal_id"),
@@ -2149,6 +2408,10 @@ def do_hire(
     ``next_step`` to check it before hiring again — ``_hire_left_deal``), and
     the timeout/dead-state ``KitFailure`` payloads carry ``stage`` too. A
     failure before any deal opened is unchanged.
+
+    A hire that ends in AWAITING_CONFIRM (no owner budget covered the deal)
+    requests ONE owner approval link (add-owner-confirm-link D-11,
+    ``_hire_owner_link``); whether or not it gets one, it returns as before.
     """
     request_ref = sha256_ref(input_bytes)
     kit.ensure_session()
@@ -2254,6 +2517,8 @@ def do_hire(
     view["deal_id"] = deal_id
     view["request_id"] = request_ref
     if state in HIRE_SUCCESS_STATES:
+        if state == STATE_AWAITING_CONFIRM:
+            _hire_owner_link(kit, view, deal_id)
         return view
     view["stage"] = stage
     if state in HIRE_DEAD_STATES:
@@ -2415,12 +2680,127 @@ def do_balance(kit: Kit) -> dict[str, Any]:
     return kit.call_tool("get_balance", {})
 
 
+# Keys that carry an owner link in kit output. Only check_owner_link's result may
+# fill them, so a bridge answer the kit prints whole (status) is printed without
+# them, at any depth and in any letter case (D-11 Slice 2 rulings).
+_LINK_KEYS = frozenset({"owner_link", "confirm_url"})
+
+
+def _without_link_keys(value: object) -> object:
+    """``value`` with every ``owner_link`` or ``confirm_url`` key (any letter case)
+    removed from every object inside it, however deeply nested."""
+    if isinstance(value, dict):
+        return {
+            key: _without_link_keys(item)
+            for key, item in value.items()
+            if not (isinstance(key, str) and key.lower() in _LINK_KEYS)
+        }
+    if isinstance(value, list):
+        return [_without_link_keys(item) for item in value]
+    return value
+
+
 def do_status(kit: Kit, *, deal_id: str) -> dict[str, Any]:
+    # A read: never requests an owner link (D-11's minting rule), so a status
+    # poll cannot replace the link the owner holds or spend an owner_link unit.
+    # The bridge's answer is printed whole, minus any key that could pass for a
+    # checked owner link.
     kit.ensure_session()
     deal = kit.call_tool("get_deal", {"deal_id": deal_id})
-    view = dict(deal)
+    view: dict[str, Any] = {
+        key: _without_link_keys(item)
+        for key, item in deal.items()
+        if not (isinstance(key, str) and key.lower() in _LINK_KEYS)
+    }
     view.update(_deal_view(deal))
     return view
+
+
+def _owner_link_deal(deal: object, *, deal_id: str) -> dict[str, Any]:
+    """The deal an owner-link answer names, ready to print.
+
+    The answer must name the requested deal (D-11 Slice 2 rulings): a missing
+    ``deal`` object, a missing ``deal_id`` or another deal is a failure, since a
+    link the kit cannot tie to this deal could confirm another one. The amount
+    fields and the provider DID are printed as counterparty text (visible
+    escapes, fence markers neutralised, the bridge's fence kept).
+    """
+    if not isinstance(deal, dict):
+        raise KitError("the marketplace's owner link answer names no deal; not showing it")
+    named = deal.get("deal_id")
+    if not isinstance(named, str) or not named:
+        raise KitError("the marketplace's owner link answer names no deal; not showing it")
+    if named.lower() != deal_id.lower():
+        raise KitError("the marketplace's owner link answer names another deal; not showing it")
+    summary: dict[str, Any] = {}
+    amount = deal.get("amount")
+    if isinstance(amount, str) and amount.isascii() and amount.isdigit():
+        summary["amount"] = amount
+    unit = deal.get("unit")
+    if isinstance(unit, str) and unit:
+        summary["unit"] = counterparty_text(unit)
+    decimals = deal.get("decimals")
+    if isinstance(decimals, int) and not isinstance(decimals, bool):
+        summary["decimals"] = decimals
+    display = deal.get("display")
+    if isinstance(display, str) and display:
+        summary["display"] = counterparty_text(display)
+    provider = deal.get("provider_did")
+    if isinstance(provider, str) and provider:
+        summary["provider_did"] = counterparty_text(provider)
+    return summary
+
+
+def request_owner_link(kit: Kit, deal_id: str) -> tuple[dict[str, str], dict[str, Any]]:
+    """Mint ONE owner approval link for ``deal_id`` and check it (D-11).
+
+    Calls the bridge's ``request_owner_confirm``, which replaces any earlier
+    link for the deal. Returns ``({"confirm_url", "expires_at"}, deal)``. Any
+    failure (the call fails, the bridge has no such tool, the link or its
+    expiry fails a check) raises :class:`KitError`, and no error carries the
+    link. Nothing is written anywhere: the kit stores no link.
+    """
+    answer = kit.call_tool(OWNER_LINK_TOOL, {"deal_id": deal_id})
+    confirm_url = check_owner_link(answer.get("confirm_url"), base_url=kit.base_url)
+    expires_at = answer.get("expires_at")
+    if not isinstance(expires_at, str) or parse_rfc3339(expires_at) is None:
+        raise KitError("the marketplace's owner link has no RFC 3339 expires_at; not showing it")
+    deal = _owner_link_deal(answer.get("deal"), deal_id=deal_id)
+    return {"confirm_url": confirm_url, "expires_at": expires_at}, deal
+
+
+def _hire_owner_link(kit: Kit, view: dict[str, Any], deal_id: str) -> None:
+    """Give a hire that ended in AWAITING_CONFIRM its owner link (D-11's minting rule).
+
+    On success the view gains ``owner_link`` (``confirm_url``, ``expires_at``)
+    and its ``next_step`` becomes ``OWNER_LINK_INSTRUCTION``. On any failure (a
+    bridge without the tool, a refusal, an outage, a link or expiry that fails
+    the checks) ``next_step`` is the kit's AWAITING_CONFIRM text naming
+    ``owner-link`` and the hire returns as before; the reason goes to stderr,
+    never the link.
+    """
+    try:
+        link, _deal = request_owner_link(kit, deal_id)
+    except KitError as exc:
+        view["next_step"] = owner_confirm_next_step(deal_id)
+        note(f"no owner approval link: {_ascii_clip(str(exc), 300)}")
+        return
+    view["owner_link"] = link
+    view["next_step"] = OWNER_LINK_INSTRUCTION
+
+
+def do_owner_link(kit: Kit, *, deal_id: str) -> dict[str, Any]:
+    """Get a one-time owner approval link for a deal waiting in AWAITING_CONFIRM (D-11).
+
+    The bridge issues one only to the deal's buyer, for an LHUB-DEV deal in
+    AWAITING_CONFIRM whose confirm deadline is at least 2 minutes away, and the
+    new link replaces the deal's previous one. The output carries the link
+    only when it passed the kit's checks; any failure is a :class:`KitError`.
+    """
+    safe_id = require_uuid(deal_id)
+    kit.ensure_session()
+    link, deal = request_owner_link(kit, safe_id)
+    return {"deal_id": safe_id, **deal, "owner_link": link, "next_step": OWNER_LINK_INSTRUCTION}
 
 
 # ---------------------------------------------------------------------------
@@ -3440,6 +3820,12 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_owner_link(args: argparse.Namespace) -> int:
+    kit = Kit.from_env(args.url)
+    emit(do_owner_link(kit, deal_id=args.deal))
+    return 0
+
+
 def cmd_result(args: argparse.Namespace) -> int:
     kit = Kit.from_env(args.url)
     emit(
@@ -4068,6 +4454,7 @@ def write_confined_output(out_path: str, root: Path, data: bytes) -> Path:
 MCP_TOOL_NAMES: tuple[str, ...] = (
     "find_services",
     "hire",
+    "owner_link",
     "get_result",
     "accept",
     "dispute",
@@ -4112,10 +4499,15 @@ def _tool_annotation(
 # not: its key makes a replay of the same proposal safe, but a repeat call
 # countersigns proposals that arrived in between (D-1 item 5). Open world:
 # the call reaches a counterparty. Hints for clients that gate tool calls;
-# nothing server-side depends on them.
+# nothing server-side depends on them. owner_link is add-owner-confirm-link
+# D-11's row (the bridge's D-3 readings): every hint false. It creates link
+# state, so it is not read-only; it moves no money and ends only a not-yet-used
+# link, so it is not destructive; a repeat replaces the link, so it is not
+# idempotent; it reaches no counterparty.
 MCP_TOOL_ANNOTATIONS: dict[str, dict[str, str | bool]] = {
     "find_services": _tool_annotation("Find services", read_only=True, idempotent=True),
     "hire": _tool_annotation("Hire a service", destructive=True, open_world=True),
+    "owner_link": _tool_annotation("Request owner confirmation link"),
     "get_result": _tool_annotation("Get result", destructive=True, idempotent=True),
     "accept": _tool_annotation(
         "Accept delivery", destructive=True, idempotent=True, open_world=True
@@ -4159,6 +4551,19 @@ def mcp_hire(
         timeout_seconds=float(timeout_seconds),
         poll_seconds=3.0,
     )
+
+
+def mcp_owner_link(deal_id: str) -> dict[str, Any]:
+    """Get a one-time approval link for a deal you hired that waits in AWAITING_CONFIRM.
+
+    A hire that stops in AWAITING_CONFIRM already returns one: give the user the
+    link `hire` returned, to open themselves; call `owner_link` (no separate
+    go-ahead — it moves no money) only when `hire` returned none, or later on the
+    user's request or after expiry, so one hire mints one link. Never open, fetch
+    or POST the link yourself, with any tool; only the user opens it. Each link
+    works once, until its expires_at; calling again replaces it.
+    """
+    return do_owner_link(Kit.from_env(), deal_id=deal_id)
 
 
 def mcp_get_result(deal_id: str, out_path: str, timeout_seconds: int = 60) -> dict[str, Any]:
@@ -4261,6 +4666,7 @@ def mcp_tool_functions() -> dict[str, Callable[..., dict[str, Any]]]:
     return {
         "find_services": mcp_find_services,
         "hire": mcp_hire,
+        "owner_link": mcp_owner_link,
         "get_result": mcp_get_result,
         "accept": mcp_accept,
         "dispute": mcp_dispute,
@@ -4472,6 +4878,15 @@ def build_parser() -> argparse.ArgumentParser:
     _add_url(p)
     p.add_argument("--deal", required=True, help="deal id")
     p.set_defaults(func=cmd_status)
+
+    p = sub.add_parser(
+        "owner-link",
+        help="get a one-time link the owner opens to approve a deal in AWAITING_CONFIRM"
+        " (replaces the deal's previous link)",
+    )
+    _add_url(p)
+    p.add_argument("--deal", required=True, help="deal id (from hire or status)")
+    p.set_defaults(func=cmd_owner_link)
 
     p = sub.add_parser("result", help="download the deliverable and verify it against the proof")
     _add_url(p)
