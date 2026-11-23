@@ -140,7 +140,7 @@ except ImportError:  # pragma: no cover - exercised only in bare environments
     sys.stderr.write("error: the kit needs the `cryptography` package: pip install cryptography\n")
     sys.exit(1)
 
-KIT_VERSION = "0.3.3"
+KIT_VERSION = "0.3.4"
 # The User-Agent on every request the kit sends. Kit._http_post, the kit's one
 # urllib entry point, stamps it over anything a caller passes, so no call site
 # can omit, blank or replace it. urllib's default ("Python-urllib/3.x") is
@@ -150,7 +150,7 @@ KIT_VERSION = "0.3.3"
 USER_AGENT = f"lhub-kit/{KIT_VERSION}"
 
 # --- wire constants (stable contracts; see docs/agents.md served by the bridge) ---
-DEFAULT_BASE_URL = "http://localhost:8092"
+DEFAULT_BASE_URL = "https://lhub.ai"
 ENV_BASE_URL = "LHUB_URL"
 ENV_KIT_HOME = "LHUB_KIT_HOME"
 DEFAULT_KIT_HOME = "~/.lhub-kit"
@@ -3778,6 +3778,7 @@ def cmd_init(args: argparse.Namespace) -> int:
             "did": kit.did,
             "key_path": str(kit.key_path),
             "home": str(kit.home),
+            "marketplace": _redact_url(kit.base_url),
             "registration": registration,
             "balance": balance,
         }
